@@ -13,9 +13,9 @@ Run `cattail` without options for help.
 
 Requirements
 
-- Apache logs in /var/log/httpd/<hostname>
-- Tomcat logs in /usr/local/tomcat_instances/<instance_name>/logs/<webapp_name>
-- Jason Fesler's `xtail` in /usr/local/bin
+- Apache logs in `/var/log/httpd/`<hostname>
+- Tomcat logs in `/usr/local/tomcat_instances/<instance_name>/logs/`<webapp_name>
+- Jason Fesler's `xtail` in `/usr/local/bin`
 
 ## xtail
 Perl script by Jason Fesler
