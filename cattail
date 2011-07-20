@@ -1,0 +1,141 @@
+#!/bin/bash
+#
+# $Id: cattail 1294 2009-09-27 04:14:08Z mheiges $
+# $URL: https://mango.ctegd.uga.edu/svn/ApiCommonSystem/trunk/WDK/bin/cattail $
+#
+
+
+########################################################################
+set_loglist(){
+
+  if [[ -z $do_apache && -z $do_tomcat && -z $do_catalina ]]; then
+    do_apache=1
+    do_tomcat=1
+  fi
+  
+  local apache_list
+  local tomcat_list
+  local catalina_list
+  
+  [ $do_apache ] && apache_list=( 
+    "/var/log/httpd/$HOST/access_log"
+    "/var/log/httpd/$HOST/error_log"
+  )
+  
+  [ $do_tomcat ] && tomcat_list=( 
+    "/usr/local/tomcat_instances/$PRODUCT/logs/$WEBAPP/"
+  )
+  
+  [ $do_catalina ] && catalina_list=( 
+    "/usr/local/tomcat_instances/$PRODUCT/logs/catalina.out"
+  )
+  
+  LOG_LIST=( ${apache_list[@]} ${tomcat_list[@]} ${catalina_list[@]} )
+
+}
+
+########################################################################
+usage() {
+  this="$(basename "$0")"
+  cat <<EOF
+
+Place a tail on standard log files used by a WDK-based website that has been
+installed using ApiDB file naming and location conventions.
+
+Usage:
+  $this [options] <hostname> [tomcat instance]
+
+options are 
+  -a  tail the Apache webserver access and error logs
+  -t  tail the Tomcat webapp log directory (may be more than one log)
+  -c  tail catalina.out
+  
+-a and -t are the defaults if no options are given. 
+
+The default tomcat instance is the name match for the product directory in
+which the webapp is installed. If your webapp is deployed in a different
+instance you may specify it.
+
+Examples:
+ $this dev.toxodb.org
+ $this dev.toxodb.org Test
+ $this -a dev.toxodb.org
+
+EOF
+  
+  exit 1
+}
+
+########################################################################
+wstatus() {
+   local instance=$1
+   local webapp=$2
+   instance_manager manage $instance list | egrep "^/$webapp:" | awk -F: "{print \$2}"
+}
+
+########################################################################
+# MAIN
+########################################################################
+
+test -z $1 && usage;
+
+while getopts 'atc' OPTION
+do
+  # sync changes wth tab completion function in apidb-tab-completion.sh
+  case $OPTION in
+  a)	do_apache=1
+        ;;
+  t)	do_tomcat=1
+        ;;
+  c)	do_catalina=1
+        ;;
+  esac
+done
+shift $(($OPTIND - 1))
+
+TAIL=/usr/local/bin/xtail
+TAIL_CMD="$TAIL --ansi"
+test -x "$TAIL" || { echo "$TAIL" not found.; exit 1; }
+
+HOST=$1
+SITE_SYMLINK="/var/www/$HOST"
+
+if [ ! -d $SITE_SYMLINK ]; then
+    echo
+    echo "Directory for '$HOST' not found. I was looking for"
+    echo "'$SITE_SYMLINK'"
+    echo "Better luck next time."
+    echo
+    exit 1
+fi
+
+WEBAPP="$(basename "$(readlink -n "$SITE_SYMLINK")")"
+
+PRODUCT="$2"
+
+if [ -z $PRODUCT ]; then
+  CONTAINER="$(dirname $(readlink -n $SITE_SYMLINK))"
+  PRODUCT=${CONTAINER##*/}
+fi
+
+set_loglist
+for log in ${LOG_LIST[@]}; do
+    if [ -e $log ]; then
+        logs="$logs $log"
+    else
+        logs_not_found="$logs_not_found $log"
+    fi
+done
+
+echo
+[ ! -z "${logs_not_found[@]}" ] && {
+  echo "Not found"
+  for l in $logs_not_found; do echo "  $l"; done;
+  echo
+}
+echo "Tailing"
+for l in $logs; do echo "  $l"; done;
+echo
+
+$TAIL_CMD $logs
+

@@ -1,0 +1,685 @@
+#!/bin/bash
+
+#
+# Rebuild an integration website for the ApiDB project.
+#
+# $Id: rebuilder 3200 2011-06-08 19:01:59Z mheiges $
+# $URL: https://mango.ctegd.uga.edu/svn/ApiCommonSystem/trunk/WDK/bin/rebuilder $
+#
+this=`basename $0`
+
+unset $(/usr/bin/env | egrep '^(\w+)=(.*)$' | \
+  egrep -vw 'PWD|USER|LANG|SUDO_USER|HOME' | /usr/bin/cut -d= -f1);
+
+for jpath in \
+    '/usr/lib/jvm/java-1.5.0-sun-1.5.0.15' \
+    '/usr/java/1.5'  \
+    '/usr/java/jdk1.5.0_10' \
+    '/files/cbil/software/java/current'; do
+    if [[ -d $jpath ]]; then
+        export JAVA_HOME="$jpath"
+        break
+    fi
+done
+
+oracle_paths='
+     /u01/app/oracle/product/11.2.0/db_1
+     /u01/app/oracle/product/11.2.0/client_1
+     /u01/app/oracle/product/10.2.0/db_1
+     /u01/app/oracle/product/10.1.0/db_1
+     /files/oracle
+'
+
+for opath in $oracle_paths; do
+    if [[ -d $opath ]]; then
+        export ORACLE_HOME="$opath"
+        break
+    fi
+done
+
+export LD_LIBRARY_PATH=$ORACLE_HOME/lib
+
+if [[ -z "$ORACLE_HOME" ]]; then
+  echo " Aborting. ORACLE_HOME not found. Looked for one of $oracle_paths"
+  exit 1
+fi
+
+# ant/java comes before system paths.
+# multiple ant paths to handle multiple servers.
+export PATH=/usr/local/ant/bin:/files/cbil/software/ant/current/bin:$JAVA_HOME/bin:/usr/local/bin:/usr/bin:/bin
+
+unset ANT_HOME
+unset AGGRESSIVE_CLEAN
+unset NON_INTERACTIVE
+unset TARGET_SITE
+unset PRODUCT
+
+INVOKE_USER=${SUDO_USER:-$USER}
+
+######################################################################
+#####              cleanup()                                   #######
+######################################################################
+cleanup() {
+    local status_code=$?
+    exit $status_code
+}
+
+######################################################################
+#####              term()                                      #######
+######################################################################
+term() {
+    echo
+    echo "doh! You stopped me, this time..."
+    exit 1
+}
+trap "cleanup 0" EXIT
+trap term INT TERM
+
+######################################################################
+#####              get_manager_credentials()                   #######
+######################################################################
+# Extract a manager username and password from a given instance's
+# conf/tomcat-users.xml. Expects at least one username with role
+# of 'manager' only (not e.g. roles='manager,admin')
+get_manager_credentials() {
+    local instance=$1
+    userxml="${TOMCAT_INSTANCES_DIR}/${instance}/conf/tomcat-users.xml"
+    test -e $userxml || { 
+       echo >&2
+       echo "'$userxml' not found." >&2
+       echo "Can not get tomcat login credentials." >&2
+       echo >&2
+       exit 1
+    }
+ 
+    cred=($(
+       perl -MXML::Simple -e \
+       "\$x=XMLin(
+            '$userxml', 
+            NormalizeSpace=>2, 
+            KeyAttr=>['roles','username'], 
+            ForceArray=>1)->{user}->{manager}; 
+            print \"\$x->{username} \$x->{password}\";"
+        ))
+
+    echo ${cred[*]}
+}
+
+######################################################################
+#####              validate_webapp_spec_list()                 #######
+######################################################################
+validate_webapp_spec_list() {
+    local wsl=$1
+    [[ $wsl =~ ":"  ]] || return 1
+    [[ "${wsl#*:}"  ]] || return 1
+    [[ "${wsl%%:*}" ]] || return 1
+    return 0
+}
+
+######################################################################
+#####                get_tomcat_specs()                        #######
+######################################################################
+get_tomcat_specs() {
+  local tomcat_instance=$1
+  tomcat_manager_cred=($(get_manager_credentials $tomcat_instance))
+  [[ "$tomcat_manager_cred" ]] || exit 1
+  
+  # get HTTP_PORT from instance.env
+  local tc_env=$TOMCAT_INSTANCES_DIR/$tomcat_instance/conf/instance.env
+  if [ ! -f $tc_env ]; then 
+      echo "<<$this>> '$tc_env' was not found." >&2
+      exit 1
+  fi
+  source $tc_env
+  
+  # return array of (manager, password, port)
+  echo "${tomcat_manager_cred[*]} $HTTP_PORT"
+}
+
+######################################################################
+#####                                                          #######
+#####              MAIN                                        #######
+#####                                                          #######
+######################################################################
+
+TOMCAT_INSTANCES_DIR='/usr/local/tomcat_instances'
+WEB_BASE_DIR='/var/www'
+RAW_ARGS="$*"
+
+# pick out and remove non-positional options
+until [ -z "$*" ]; do
+    arg=$1
+
+    if   [[ "$arg" == "--help" || "$arg" == "help" ]]; then
+         SHOW_HELP=1
+    elif [[ "$arg" == "--ignore-ip" ]]; then
+        IGNORE_IP=1
+    elif [[ "$arg" == "--reinstall-config" ]]; then
+        REINSTALL_CONFIG=1
+    elif [[ "$arg" =~ "--do_aggressive_clean" ]]; then
+        AGGRESSIVE_CLEAN=doaggressiveclean
+    elif [[ "$arg" =~ "--non-interactive" ]]; then
+        NON_INTERACTIVE=noninteractive
+    elif [[ "$arg" =~ "--aka$" ]]; then
+        shift
+        validate_webapp_spec_list "$1"; val=$?
+        [[ $val -eq 1 ]] && { 
+            echo "invalid --aka value. Expected syntax is"
+            echo "Instance:context"
+            echo "You gave me '$1'."
+            exit 1
+        }
+        AKA="$1"
+    elif [[ "$arg" =~ "--webapp$" ]]; then
+        shift
+        validate_webapp_spec_list "$1"; val=$?
+        [[ $val -eq 1 ]] && { 
+            echo "invalid --webapp value. Expected syntax is"
+            echo "Instance:context"
+            echo "You gave me '$1'."
+            exit 1
+        }
+        WEBAPP_SPEC_LIST="$WEBAPP_SPEC_LIST $1"
+    elif [[ "$arg" =~ "--skip-svn-update$" ]]; then
+        SKIP_SVN_UPDATE=1
+    elif [[ "$arg" =~ "^--" ]]; then
+        echo
+        echo "I don't understand '$arg'. See"
+        echo "  $this --help"
+        echo "for more information."
+        exit 1
+    else
+        ARGS_NOOPTS="$ARGS_NOOPTS $arg"
+    fi
+
+    shift
+done
+
+# assign from remaining positional parameters
+set -- $ARGS_NOOPTS
+export TARGET_SITE=$1; shift
+#export PRODUCT=$2; shift
+set --
+
+
+SITE_SYMLINK="$WEB_BASE_DIR/$TARGET_SITE"
+# if ! PRODUCT
+  CONTAINER="$(dirname $(readlink -n $SITE_SYMLINK) 2> /dev/null)"
+  PRODUCT=${CONTAINER##*/}
+# fi
+
+export SITE_REAL_PATH="$(readlink -nf "$SITE_SYMLINK")"
+export PROJECT_HOME=$SITE_REAL_PATH/project_home
+export GUS_HOME=$SITE_REAL_PATH/gus_home
+export PATH=$GUS_HOME/bin:$PROJECT_HOME/install/bin:$PATH
+
+if [[ ! $TARGET_SITE || "$TARGET_SITE" == "shell" || "$SHOW_HELP" == "1" ]]; then
+    echo
+    if [ "$TARGET_SITE" == "shell" ]; then
+      echo
+      echo
+      echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+      echo "FATAL: Missing <hostname>"
+    else
+      echo "Rebuild an existing WDK-based website for the ApiDB BRC project."
+    fi
+    echo
+    echo "usage: $this <hostname> [options]"
+    echo
+    echo "where <hostname> is the website you want to rebuild."
+    echo "For example,"
+    echo "  $this user.eupathdb.org"
+    echo
+    echo "You must own and have write permissions for the files of the site being rebuilt."
+    echo "A rebuild includes:"
+    echo " 1. undeployment of the webapp from tomcat"
+    echo " 2. deleting all installed files, leaving project_home and gus_home/config"
+    echo " 3. deleting svn ignored files in project_home (primarily compiled java classes)."
+    echo " 4. an svn update of project_home working directories (requires gussvn)"
+    echo " 5. a build of the *DBWebsite and its dependencies"
+    echo " 6. redeployment of the webapp into tomcat"
+    echo " 7. a build and deployment of WebServices"
+    echo " 8. recreating the WDK cache tables"
+    echo
+    echo "Options:"
+    echo "  --reinstall-config"
+    echo "      Delete \$GUS_HOME/config and reinstall with default files "
+    echo "  --webapp Instance:context"
+    echo "      The default Tomcat webapp name redeployed during a rebuild is "
+    echo "      derived from directory naming conventions unless you specify the"
+    echo "      tomcat instance and context with one or more --webapp options. A"
+    echo "      Tomcat context configuration XML must be present in the site's etc"
+    echo "      directory for each webapp specified. At least one of the Tomcat"
+    echo "      instances named should match the one specified in the site's"
+    echo "      etc/wsf.prop file so WSF will deploy correctly."
+    echo "         $this w1.giardiadb.org \\"
+    echo "          --webapp GiardiaDB:giardiadb \\"
+    echo "          --webapp GiardiaDB:giardiadb1.1 \\"
+    echo "          --webapp Test:giardia1.1 "
+    echo "  --ignore-ip"
+    echo "      Skip the verification that this machine is one registered in DNS"
+    echo "      for the site's host name."
+    echo "  --skip-svn-update"
+    echo "      Skip the gussvn update. Useful if you need to manually set and"
+    echo "      build your project to specific svn revisions. Svn ignore files"
+    echo "      are still deleted."
+    echo "  --aka Instance:context"
+    echo "      Similar to --webapp but only requires specifying the alternative"
+    echo "      tomcat instance and context. The native context name will be"
+    echo "      derived from directory naming conventions. Both the native and"
+    echo "      alternative context will be managed. This option is useful for"
+    echo "      automated build configurations of live sites as it allows a "
+    echo "      consistent build command for live sites across all release versions."
+    echo "      '--aka' takes precedent over '--webapp'. The two can not be used"
+    echo "      together"
+    echo "         $this w1.giardiadb.org --aka GiardiaDB:giardiadb"
+    echo 
+    exit 1
+fi
+
+if [[ ! -d "$PROJECT_HOME/ApiCommonWebsite" && ! -d "$PROJECT_HOME/${PRODUCT}Website" ]]; then
+    echo
+    echo "$TARGET_SITE does not look like a valid site because"
+    echo "neither '$PROJECT_HOME/ApiCommonWebsite' "
+    echo "nor '$PROJECT_HOME/${PRODUCT}Website' were not found."
+    echo "quitting..."
+    echo
+    exit 1
+fi
+
+ip_addr=$(getent hosts $TARGET_SITE | \
+        sed 's/\([[:digit:]]*\.[[:digit:]]*\.[[:digit:]]*\.[[:digit:]]*\) .*/\1/')
+
+if [[ (! "$ip_addr") && (! "$IGNORE_IP") ]]; then
+    echo
+    echo "I can not find '$TARGET_SITE' in the DNS."
+    echo "Is '$TARGET_SITE' a valid site?"
+    echo "To rebuild anyway, run:"
+    echo "  $this $RAW_ARGS --ignore-ip"
+    exit 1
+fi
+
+is_host=$(/sbin/ifconfig | grep "$ip_addr")
+if [[ (! "$is_host") && (! "$IGNORE_IP") ]]; then
+    echo
+    echo "This does not seem to be the host for '$TARGET_SITE'."
+    echo "That host appears to be at '$ip_addr' "
+    echo "To rebuild anyway, run:"
+    echo "  $this $RAW_ARGS --ignore-ip"
+    exit 1
+fi
+
+
+if [ ! -e "$SITE_SYMLINK" ]; then 
+    echo
+    echo "<$this> '$SITE_SYMLINK' is not valid. Aborting...."
+    exit 1
+fi
+
+for f in $SITE_SYMLINK/{,gus_home/{bin,data,doc,lib,test,wsf-lib},project_home,html,cgi-bin,cgi-lib,conf,webapp}; do 
+    if [[ -e $f && ! -O $f ]]; then
+        echo
+        echo "'$f' is not owned by you. I refuse to continue."
+        echo
+        exit 1
+    fi
+done
+
+if [ "$NON_INTERACTIVE" != "noninteractive" ]; then
+    # pause for user verification
+    echo
+    echo "I am about to update and rebuild $TARGET_SITE."
+    echo
+    echo "Any site modifications you have made outside project_home"
+    echo "and gus_home/config will be lost. Capisce? I'm not kidding."
+    
+    if [[ "$REINSTALL_CONFIG" ]]; then
+        echo
+        echo -e "\033[1m!!!!!! SPECIAL NOTICE !!!!!!\033[0m"
+        echo "Your inclusion of the --reinstall-config option will cause your"
+        echo "gus_home/config to be deleted and reinstalled with default files,"
+        echo "removing custom configurations. Do not use this option if resetting"
+        echo "configuration files is not desired."
+    fi
+
+    if [[ -d "${PROJECT_HOME}/${PRODUCT}Data" ]]; then
+        echo
+        echo -e "\033[1m!!!!!! SPECIAL NOTICE !!!!!!\033[0m"
+        echo "'${PRODUCT}Data' in PROJECT_HOME is deprecated."
+        echo "Check for uncommitted code and remove ${PRODUCT}Data if"
+        echo "this site uses svn trunk or a branch made after Sept. 19, 2009."
+        echo
+    fi  
+
+    echo
+    echo -n "Shall I continue?[y/n] "
+    read ans
+    case "$(echo -n $ans | tr '[:upper:]' '[:lower:]')" in
+    y|yes)
+      ;;
+    *) 
+      exit 1
+      ;;
+    esac
+    echo
+fi
+
+WEBAPP=$(basename $(readlink -n $SITE_SYMLINK))
+if [ "$AKA" ]; then
+  WEBAPP_SPEC_LIST="$PRODUCT:$WEBAPP $AKA"
+else
+  WEBAPP_SPEC_LIST=${WEBAPP_SPEC_LIST:-"$PRODUCT:$WEBAPP"}
+fi
+
+for wsl in $WEBAPP_SPEC_LIST; do
+  WEBAPP=${wsl#*:}
+  TOMCAT_INSTANCE=${wsl%%:*}
+  tomcat_specs=($(get_tomcat_specs $TOMCAT_INSTANCE))
+  [[ "$tomcat_specs" ]] || exit 1
+  
+  TC_USER=${tomcat_specs[0]}
+  TC_PASS=${tomcat_specs[1]}
+  TOMCAT_PORT=${tomcat_specs[2]}
+
+  if [ ! -e "$SITE_SYMLINK/etc/$WEBAPP.xml" ]; then
+      echo
+      echo "<$this> '$SITE_SYMLINK/etc/$WEBAPP.xml' not found."
+      echo "<$this> I won't be able to deploy the webapp without it."
+      echo "<$this> Aborting...."
+      exit 1
+  fi
+  
+  echo -e "\n\n\n//// <$this> undeploying $WEBAPP webapp from $TOMCAT_INSTANCE //////\n\n\n";
+  curl "http://$TC_USER:$TC_PASS@127.0.0.1:$TOMCAT_PORT/manager/list" 2>/dev/null | \
+  awk -F: '{print $1}' | egrep "^/$WEBAPP\$" && \
+  echo -e "\n<$this> Undeploying existing '$WEBAPP' from tomcat\n" && \
+  curl "http://$TC_USER:$TC_PASS@127.0.0.1:$TOMCAT_PORT/manager/undeploy?path=/$WEBAPP" 2> /dev/null
+
+done
+
+# Figure out where which project starts the build.
+# *DBWebsite takes precedent over ApiCommonWebsite (but there should be only one of these in project_home)
+if [[ -d "${PROJECT_HOME}/${PRODUCT}Website" ]]; then
+    BUILDPOINT=${PRODUCT}Website
+else
+    BUILDPOINT=ApiCommonWebsite
+fi
+
+#### DELETE OLD SITE #####
+
+# if gbrowse is currently installed, we'll reinstall it and bioperl.
+# The build.xml installs the cgi-bin/gbrowse file from svn,
+# so using gbrowse_moby as the test for a full gbrowse/bioperl build.
+#test -e "$SITE_SYMLINK/cgi-bin/gbrowse_moby" && INSTALL_GBROWSE=1
+# Nevermind, always install (can't rely on gbrowse_moby as a flag).
+INSTALL_GBROWSE=1
+
+# remove installed files except data and $GUS_HOME/config
+cd $SITE_SYMLINK
+
+rm -rf html
+
+# provide an error file for the site, with an old timestamp so WDK build
+# replaces it with the site's 'newer' error file from svn
+mkdir html
+echo "This site is undergoing a rebuild. Please check back in a few minutes.<br><font size='-2'>$INVOKE_USER</font>" > html/500.shtml
+echo "<br>Started on $(date +'%b %d, %Y at %l:%M%p')" >> html/500.shtml
+touch -t 8001010100 html/500.shtml
+
+rm_installed_files () {
+  rm -rf cgi-lib                                   \
+         cgi-bin                                   \
+         conf                                      \
+         webapp                                    \
+         gus_home/{bin,data,doc,lib,test,wsf-lib}  \
+         gus_home/config/.build.info               \
+         hs_err_pid*
+}
+
+rm_installed_files
+
+if [ $? != 0 ]; then
+    # Crude hack...
+    # Probably .nfs* files in lib/java held open by Tomcat process are
+    # preventing clean directory removal.
+    # Try moving the lib/java dir and then re-try the rm_installed_files.
+    if [ ! -e "$SITE_SYMLINK/.TRASH" ]; then
+        mkdir "$SITE_SYMLINK/.TRASH"
+    fi
+    if [ -e "$SITE_SYMLINK/gus_home/lib/java" ]; then
+        mv "$SITE_SYMLINK/gus_home/lib/java" "$SITE_SYMLINK/.TRASH/java.$$"
+    fi
+    # clean out any old .nfs files that may now be closed.
+    if [ -e "$SITE_SYMLINK/.TRASH" ]; then
+        rm -rf "$SITE_SYMLINK/.TRASH"
+    fi
+    # retry
+    rm_installed_files
+fi
+
+if [[ "$REINSTALL_CONFIG" ]]; then
+    if [[ -d gus_home/config ]]; then
+        find gus_home/config -type f -not -name gus.config -exec rm -f '{}' \;
+    fi
+fi
+
+if [ $? != 0 ]; then 
+  echo
+  echo
+  echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+  echo -e "\n<$this> FATAL: I was unable to remove all the installed files."
+  echo -e "Stopping installation. You will need to correct the failure and rerun $this."
+  echo "Maybe you are not worthy to delete them?"
+  exit 1
+fi
+
+# in situ built class files have proven to mask problems with webservices.
+# Remove the svn ignores files and choose whether to be
+# aggressive, remove anything from svn working copies that did not 
+# come directly from svn. This includes modified and new files.
+if [ "$AGGRESSIVE_CLEAN" == "doaggressiveclean" ]; then
+    T='.'
+else
+    T='I'
+fi
+find $SITE_SYMLINK/project_home -follow -maxdepth 1 -type d -not -name '.' | \
+     xargs svn status --no-ignore 2>&-    | \
+     egrep "^$T     "                     | \
+     sed 's/^.     //'                    | \
+     xargs --no-run-if-empty rm -rf
+if [ $? != 0 ]; then 
+  echo
+  echo
+  echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+  echo -e "\n<$this> FATAL: There are files in svn working copies that I can not remove."
+  echo "These have to be removed somehow before re-running this script."
+  exit 1
+fi
+
+#### END DELETE OLD SITE #####
+
+#### SVN UPDATE #####
+## We use gussvn so new checkout dependencies defined in build.xml 
+## can be honored without having to add them to this script.
+## Actually we just call the ant command from gussvn because gussvn.pl has
+## tainted variables that error when run under suid.
+
+if [[ "$SKIP_SVN_UPDATE" ]]; then
+  echo "//////////////////////////////////////////////////////"
+  echo "skipping svn update"
+  echo '\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\'
+else
+  # gussvn doesn't update install
+  UP_INSTALL="svn update $PROJECT_HOME/install"
+  echo "<$this> $UP_INSTALL"
+  $UP_INSTALL
+  if [ $? != 0 ]; then 
+    echo
+    echo
+    echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    echo -e "\n<$this> FATAL: The installation aborted while attempting\n'$UP_INSTALL'"
+    echo -e "Stopping installation. You will need to correct the failure and rerun $this."
+    echo "I'll wait for you."
+    exit 1
+  fi
+  
+  GUSSVN="ant -f $PROJECT_HOME/install/build.xml update -lib ${PROJECT_HOME}/install/config -Dproj=$BUILDPOINT -DprojectsDir=$PROJECT_HOME -logger org.apache.tools.ant.NoBannerLogger"
+  echo "<$this> $GUSSVN"
+  $GUSSVN
+  if [ $? != 0 ]; then 
+    echo
+    echo
+    echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    echo -e "\n<$this> FATAL: The installation aborted while attempting\n'$GUSSVN'"
+    echo -e "Stopping installation. You will need to correct the failure and rerun $this."
+    echo "I'll wait for you."
+    exit 1
+  fi
+  
+  GUSSVN="ant -f $PROJECT_HOME/install/build.xml update -lib ${PROJECT_HOME}/install/config -Dproj=ApiCommonWebService -DprojectsDir=$PROJECT_HOME -logger org.apache.tools.ant.NoBannerLogger"
+  echo "<$this> $GUSSVN"
+  $GUSSVN
+  if [ $? != 0 ]; then 
+    echo
+    echo
+    echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    echo -e "\n<$this> FATAL: The installation aborted while attempting\n'$GUSSVN'"
+    echo -e "Stopping installation. You will need to correct the failure and rerun $this."
+    echo "I'll wait for you."
+    exit 1
+  fi
+fi # if $SKIP_SVN_UPDATE
+
+
+#### MAKE/INSTALL GBROWSE if already installed #####
+if [ $INSTALL_GBROWSE ]; then
+echo -e "\n<$this> Installing GBrowse\n"
+GBINST="$PROJECT_HOME/$BUILDPOINT/Model/bin/install_gbrowse $SITE_SYMLINK/etc/webapp.prop make_install_patch"
+echo "<$this>  $GBINST"
+$GBINST
+if [ $? != 0 ]; then 
+  echo
+  echo
+  echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+  echo -e "\n<$this> FATAL: The installation aborted while attempting\n'$GBINST'"
+  echo -e "Stopping installation. You will need to correct the failure and rerun $this."
+  echo "I'll wait for you."
+  exit 1
+fi
+fi
+
+#### MAKE/INSTALL R GDD #####
+if [ -e "$PROJECT_HOME/$BUILDPOINT/Model/bin/install_GDD" ]; then
+  echo -e "\n<$this> Installing R GDD\n"
+  GDDINST="$PROJECT_HOME/$BUILDPOINT/Model/bin/install_GDD $SITE_SYMLINK/etc/webapp.prop install"
+  echo "<$this>  $GDDINST"
+  $GDDINST
+  if [ $? != 0 ]; then 
+    echo
+    echo
+    echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    echo -e "\n<$this> FATAL: The installation aborted while attempting\n'$GDDINST'"
+    echo -e "Stopping installation. You will need to correct the failure and rerun $this."
+    echo "I'll wait for you."
+    exit 1
+  fi
+fi
+
+#### BUILD WDK #####
+if [[ "$REINSTALL_CONFIG" ]]; then
+    mkdir -p $SITE_SYMLINK/gus_home/config
+    cp $SITE_SYMLINK/project_home/install/gus.config.sample \
+       $SITE_SYMLINK/gus_home/config/gus.config
+fi
+# *DBWebsite is deprecated
+if [[ -d "${PROJECT_HOME}/${PRODUCT}Website" ]]; then
+  BLDWDK="build ${PRODUCT}Website webinstall -append -webPropFile $SITE_SYMLINK/etc/webapp.prop"
+else
+  BLDWDK="build ApiCommonWebsite webinstall -append -webPropFile $SITE_SYMLINK/etc/webapp.prop"
+fi
+echo "<$this> $BLDWDK"
+$BLDWDK
+if [ $? != 0 ]; then 
+  echo
+  echo
+  echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+  echo -e "\n<$this> FATAL: The installation aborted while attempting\n'$BLDWDK'"
+  echo -e "Stopping installation. You will need to correct the failure and rerun $this."
+  echo "I'll wait for you."
+  exit 1
+fi
+
+echo -e "\n\n\n//////// <$this> Recreate WDK Cache //////////\n\n\n";
+wdkCache -model $PRODUCT -recreate
+if [ $? != 0 ]; then 
+  echo
+  echo
+  echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+  echo -e "\n<$this> FATAL: I was unable to recreate the WDK cache."
+  echo -e "Stopping installation. You will need to correct the failure and rerun $this."
+  exit 1
+fi
+
+####  DEPLOY WEBAPP #####
+
+for wsl in $WEBAPP_SPEC_LIST; do
+  WEBAPP=${wsl#*:}
+  TOMCAT_INSTANCE=${wsl%%:*}
+  tomcat_specs=($(get_tomcat_specs $TOMCAT_INSTANCE))
+  TC_USER=${tomcat_specs[0]}
+  TC_PASS=${tomcat_specs[1]}
+  TOMCAT_PORT=${tomcat_specs[2]}
+  
+  echo -e "\n\n\n///// <$this> deploying $WEBAPP into $TOMCAT_INSTANCE //////\n\n\n";
+
+  #log_size=`stat --format='%s' /usr/local/tomcat/$TOMCAT_INSTANCE/logs/$WEBAPP/wdk.log4j`
+  curl "http://$TC_USER:$TC_PASS@127.0.0.1:$TOMCAT_PORT/manager/deploy?config=file:$SITE_SYMLINK/etc/$WEBAPP.xml&war&path=/$WEBAPP"
+  # how did the deployment go?
+  tc_status=`curl "http://$TC_USER:$TC_PASS@127.0.0.1:$TOMCAT_PORT/manager/list" 2>/dev/null | \
+  egrep "^/${WEBAPP}:" | awk -F: '{print $2}'`
+  
+  case "$tc_status" in
+      running)
+          echo -e "\n<$this> Webapp is deployed and running. w00t!\n"
+          ;;
+      *)
+          echo
+          echo
+          echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+          echo -e "\n<$this> FATAL: The installation aborted while attempting"
+          echo "to deploy the webapp. The webapp is either not deployed"
+          echo "or is deployed but not running."
+          echo -e "Stopping installation. You will need to correct the failure and rerun $this."
+          echo "I'll wait for you."
+          exit 1
+          ;;
+  esac
+
+done
+#### END DEPLOY WEBAPP #####
+
+#### BUILD WEBSERVICES #####
+
+echo -e "\n\n\n//////// <$this> Building ApiCommonWebservices //////////\n\n\n";
+BLDWSF="build ApiCommonWebService webinstall -append -webPropFile $SITE_SYMLINK/etc/wsf.prop"
+echo "<$this> $BLDWSF"
+$BLDWSF
+if [ $? != 0 ]; then 
+  echo
+  echo
+  echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+  echo -e "\n<$this> FATAL: The installation aborted while attempting\n'$BLDWSF'"
+  echo -e "Stopping installation. You will need to correct the failure and rerun $this."
+  echo "I'll wait for you."
+  exit 1
+fi
+
+#### RELOAD WEBAPPS #####
+
+for wsl in $WEBAPP_SPEC_LIST; do
+  WEBAPP=${wsl#*:}
+  TOMCAT_INSTANCE=${wsl%%:*}
+
+  echo -e "\n\n\n///// <$this> reload webapp $WEBAPP in $TOMCAT_INSTANCE /////\n\n\n";
+  instance_manager manage $TOMCAT_INSTANCE reload $WEBAPP
+done
