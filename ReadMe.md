@@ -33,7 +33,7 @@ Requirements
 
 
 ## ibuilder
-Rebuild an existing WDK-based integration website owned by joeuser.
+Rebuild an existing WDK-based integration website owned by `joeuser`.
 
 Run `ibuilder` without options for help.
 
