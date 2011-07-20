@@ -30,7 +30,7 @@ Requirements
 - java in one of the locations listed in the `jpath` search path hard-coded in the script.
 - `$ORACLE_HOME` in one of the locations listed in the `oracle_paths` hard-coded in the script.
 - sudoers permissions to grant users permissions to manage `httpd`. See below.
-
+- `wsf.prop` and `webapp.prop` in the website's `etc` directory
 
 ## ibuilder
 Rebuild an existing WDK-based integration website owned by `joeuser`.
